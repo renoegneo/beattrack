@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("DesktopVisualizer")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+c9abac7141cbcf7e3c27f262766b93a4d9bb83c8")]
 [assembly: System.Reflection.AssemblyProductAttribute("DesktopVisualizer")]
 [assembly: System.Reflection.AssemblyTitleAttribute("DesktopVisualizer")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

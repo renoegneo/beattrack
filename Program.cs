@@ -3,17 +3,17 @@ using Raylib_cs;
 
 var analysisSettings = new AudioAnalysisSettings
 {
-    // These become UI sliders later. The defaults keep levels absolute:
-    // no adaptive maximum, only a fixed dBFS floor/ceiling.
+    FftSize = 4096,
+    SpectrumBandCount = 64,
     FloorDbfs = -72,
-    CeilingDbfs = -3,
-    InputGainDb = 14,
-    ResponseCurve = 2.5,
-    AttackMilliseconds = 10,
-    ReleaseMilliseconds = 30,
+    CeilingDbfs = -6,
+    InputGainDb = 20,
+    ResponseCurve = 2.6,
+    AttackMilliseconds = 20,
+    ReleaseMilliseconds = 40,
     SilenceThreshold = 0.01,
-    SnapToZeroInSilence = true,
-    LogMeasuredLevels = false
+    SnapToZeroInSilence = false,
+    LogMeasuredLevels = true
 };
 
 var audioState = new AudioState();
@@ -29,16 +29,10 @@ capture.StartRecording();
 
 IVisualizerStyle[] styles =
 [
-    new CircleStyle(),
-    new BarsStyle(),
-    new TriBandStyle(),
-    new HSVReactiveStyle(),
-    new CustomGradientStyle(),
-    new NebulaStyle(),
-    new DubstepGutterStyle(),
-    new FullWidthBarcodeStyle()
+    new SpectrumBarsStyle(),
+    new PlasmaCoreStyle()
 ];
-int currentStyleIndex = 7;
+int currentStyleIndex = 1;
 
 Raylib.InitWindow(1000, 800, "Аудио-визуализатор");
 Raylib.SetTargetFPS(90);
@@ -61,12 +55,9 @@ while (!Raylib.WindowShouldClose())
 
     var frame = new AudioFrame
     {
-        Bass = level.Bass,
-        Mid = level.Mid,
-        High = level.High,
-        BassDbfs = level.BassDbfs,
-        MidDbfs = level.MidDbfs,
-        HighDbfs = level.HighDbfs
+        Spectrum = level.Unit,
+        SpectrumDbfs = level.Dbfs,
+        BandRanges = analyzer.Bands
     };
 
     styles[currentStyleIndex].Update(frame, deltaTime);

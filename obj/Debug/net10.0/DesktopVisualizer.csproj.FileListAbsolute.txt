@@ -42,3 +42,4 @@ C:\Users\egnev\OneDrive\Рабочий стол\projects\csharp\visualiser\Deskt
 C:\Users\egnev\OneDrive\Рабочий стол\projects\csharp\visualiser\DesktopVisualizer\obj\audio-analysis-check\runtimes\osx-x64\native\libraylib.dylib
 C:\Users\egnev\OneDrive\Рабочий стол\projects\csharp\visualiser\DesktopVisualizer\obj\audio-analysis-check\runtimes\win-x64\native\raylib.dll
 C:\Users\egnev\OneDrive\Рабочий стол\projects\csharp\visualiser\DesktopVisualizer\obj\audio-analysis-check\runtimes\win-x86\native\raylib.dll
+C:\Users\egnev\OneDrive\Рабочий стол\projects\csharp\visualiser\DesktopVisualizer\obj\Debug\net10.0\DesktopVisualizer.sourcelink.json

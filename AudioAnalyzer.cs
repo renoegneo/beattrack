@@ -1,10 +1,6 @@
 using NAudio.Dsp;
 using NAudio.Wave;
 
-/// <summary>
-/// Produces calibrated dBFS and the single, attack/release-filtered stream
-/// consumed by every visual style.
-/// </summary>
 public sealed class AudioAnalyzer
 {
     private const double DbEpsilon = 1e-12;
@@ -16,14 +12,23 @@ public sealed class AudioAnalyzer
     private readonly Complex[] _fft;
     private readonly double[] _window;
     private readonly double _windowCoherentGain;
-    private readonly EnvelopeFollower _bassEnvelope;
-    private readonly EnvelopeFollower _midEnvelope;
-    private readonly EnvelopeFollower _highEnvelope;
+
+    private FrequencyRange[] _bands;
+    private EnvelopeFollower[] _bandEnvelopes;
+    private double[] _bandPower;
+
+    // Кэш: какому бину какая полоса соответствует. Пересчитывается только
+    // если поменялась частота дискретизации (на практике — один раз за сессию)
+    private int _cachedSampleRate = -1;
+    private int[] _binToBand = Array.Empty<int>();
+    private int[] _bandBinCounts = Array.Empty<int>();
 
     private int _writeIndex;
     private int _collectedSamples;
     private int _samplesSinceAnalysis;
     private long _lastLogTimestamp;
+
+    public FrequencyRange[] Bands => _bands; // наружу — для AudioFrame.BandRanges
 
     public AudioAnalyzer(AudioAnalysisSettings settings, AudioState state)
     {
@@ -35,6 +40,8 @@ public sealed class AudioAnalyzer
             throw new ArgumentException("The dBFS floor must be lower than the ceiling.", nameof(settings));
         if (settings.ResponseCurve <= 0)
             throw new ArgumentException("Response curve must be positive.", nameof(settings));
+        if (settings.SpectrumBandCount <= 0)
+            throw new ArgumentException("Spectrum band count must be positive.", nameof(settings));
 
         _settings = settings;
         _state = state;
@@ -49,11 +56,11 @@ public sealed class AudioAnalyzer
             _window[i] = 0.5 * (1 - Math.Cos(2 * Math.PI * i / (_window.Length - 1)));
             windowSum += _window[i];
         }
-
         _windowCoherentGain = windowSum / _window.Length;
-        _bassEnvelope = CreateEnvelope();
-        _midEnvelope = CreateEnvelope();
-        _highEnvelope = CreateEnvelope();
+
+        _bands = Array.Empty<FrequencyRange>();
+        _bandEnvelopes = Array.Empty<EnvelopeFollower>();
+        _bandPower = Array.Empty<double>();
     }
 
     public void PushAudio(byte[] buffer, int bytesRecorded, WaveFormat format)
@@ -89,9 +96,6 @@ public sealed class AudioAnalyzer
         if (_collectedSamples < _sampleRing.Length || _samplesSinceAnalysis < _settings.AnalysisHopSize)
             return;
 
-        // writeIndex now points at the oldest sample, so this copy is a
-        // chronological, overlapping FFT window. At 48 kHz / hop 256 we
-        // produce a new envelope point every ~5.3 ms rather than every ~43 ms.
         for (int i = 0; i < _analysisSamples.Length; i++)
             _analysisSamples[i] = _sampleRing[(_writeIndex + i) % _sampleRing.Length];
 
@@ -99,57 +103,139 @@ public sealed class AudioAnalyzer
         _samplesSinceAnalysis = 0;
     }
 
+    // Строит таблицу "бин -> индекс полосы" один раз и переиспользует её,
+    // пока частота дискретизации не изменится. Без этого пришлось бы
+    // пересчитывать Contains() для каждого бина 189 раз в секунду впустую —
+    // граница полос не меняется от кадра к кадру, только реальные амплитуды
+    private void EnsureBinMapping(int sampleRate)
+    {
+        if (sampleRate == _cachedSampleRate)
+            return;
+
+        _cachedSampleRate = sampleRate;
+        int totalBins = _analysisSamples.Length / 2;
+        double hzPerBin = sampleRate / (double)_analysisSamples.Length;
+
+        int minBin = Math.Max(1, (int)Math.Floor(_settings.MinimumFrequencyHz / hzPerBin));
+        int maxBin = Math.Min(totalBins - 1, (int)Math.Ceiling(_settings.MaximumFrequencyHz / hzPerBin));
+        int usableBins = maxBin - minBin + 1;
+
+        int requestedBandCount = _settings.SpectrumBandCount;
+        int actualBandCount = Math.Min(requestedBandCount, usableBins);
+
+        if (actualBandCount != requestedBandCount)
+            Console.WriteLine($"[Audio] Запрошено {requestedBandCount} полос, физически различимо только {usableBins} — используем {actualBandCount}.");
+
+        _bands = new FrequencyRange[actualBandCount];
+        _binToBand = new int[totalBins];
+        Array.Fill(_binToBand, -1);
+        _bandBinCounts = new int[actualBandCount];
+
+        double ratio = Math.Pow(_settings.MaximumFrequencyHz / _settings.MinimumFrequencyHz, 1.0 / actualBandCount);
+        int previousEndBin = minBin;
+        double edgeHz = _settings.MinimumFrequencyHz;
+
+        for (int i = 0; i < actualBandCount; i++)
+        {
+            edgeHz *= ratio;
+            int desiredEndBin = (int)Math.Round(edgeHz / hzPerBin);
+
+            // Вот эта строчка и есть весь фикс: "минимум предыдущий бин + 1" —
+            // не даёт полосе остаться пустой, даже если формула "хочет"
+            // уместить несколько полос в один и тот же бин
+            int endBin = Math.Max(previousEndBin + 1, desiredEndBin);
+            if (i == actualBandCount - 1)
+                endBin = maxBin + 1; // последняя полоса подчищает всё, что осталось
+            endBin = Math.Min(endBin, maxBin + 1);
+
+            for (int bin = previousEndBin; bin < endBin && bin < totalBins; bin++)
+                _binToBand[bin] = i;
+
+            _bandBinCounts[i] = endBin - previousEndBin;
+            _bands[i] = new FrequencyRange(previousEndBin * hzPerBin, endBin * hzPerBin);
+            previousEndBin = endBin;
+        }
+
+        _bandEnvelopes = new EnvelopeFollower[actualBandCount];
+        for (int i = 0; i < _bandEnvelopes.Length; i++)
+            _bandEnvelopes[i] = CreateEnvelope();
+        _bandPower = new double[actualBandCount];
+
+        if (_settings.LogMeasuredLevels)
+        {
+            Console.WriteLine($"[Audio] Разрешение: {hzPerBin:F2} Гц/бин, реальных полос: {actualBandCount}");
+            for (int i = 0; i < _bands.Length; i++)
+                Console.WriteLine($"[Audio] Полоса {i}: {_bands[i].StartHz:F0}-{_bands[i].EndHz:F0} Гц, бинов: {_bandBinCounts[i]}");
+        }
+    }
+
+    private int FindBandIndex(double frequency)
+    {
+        for (int i = 0; i < _bands.Length; i++)
+        {
+            if (_bands[i].Contains(frequency))
+                return i;
+        }
+        return -1; // частота вне рабочего диапазона (ниже Min или выше Max)
+    }
+
     private void Analyze(int sampleRate)
     {
-        double inputPower = 0;
+        EnsureBinMapping(sampleRate);
+
         for (int i = 0; i < _analysisSamples.Length; i++)
         {
-            inputPower += _analysisSamples[i] * _analysisSamples[i];
             _fft[i].X = (float)(_analysisSamples[i] * _window[i]);
             _fft[i].Y = 0;
         }
-        inputPower /= _analysisSamples.Length;
 
         FastFourierTransform.FFT(true, System.Numerics.BitOperations.TrailingZeroCount(_analysisSamples.Length), _fft);
 
-        double bassPower = 0;
-        double midPower = 0;
-        double highPower = 0;
+        Array.Clear(_bandPower);
         double amplitudeScale = 2.0 / (_windowCoherentGain * Math.Sqrt(2));
 
-        for (int bin = 1; bin < _analysisSamples.Length / 2; bin++)
+        for (int bin = 1; bin < _binToBand.Length; bin++)
         {
-            double frequency = bin * (double)sampleRate / _analysisSamples.Length;
-            if (frequency < _settings.MinimumFrequencyHz || frequency > _settings.MaximumFrequencyHz)
+            int band = _binToBand[bin];
+            if (band < 0)
                 continue;
 
             double real = _fft[bin].X;
             double imaginary = _fft[bin].Y;
             double rmsAmplitude = Math.Sqrt(real * real + imaginary * imaginary) * amplitudeScale;
-            double power = rmsAmplitude * rmsAmplitude;
-
-            if (_settings.Bass.Contains(frequency)) bassPower += power;
-            else if (_settings.Mid.Contains(frequency)) midPower += power;
-            else if (_settings.High.Contains(frequency)) highPower += power;
+            _bandPower[band] += rmsAmplitude * rmsAmplitude;
         }
 
-        double bassDbfs = PowerToDbfs(bassPower) + _settings.InputGainDb;
-        double midDbfs = PowerToDbfs(midPower) + _settings.InputGainDb;
-        double highDbfs = PowerToDbfs(highPower) + _settings.InputGainDb;
+        var spectrumUnit = new double[_bands.Length];
+        var spectrumDbfs = new double[_bands.Length];
         double deltaSeconds = _settings.AnalysisHopSize / (double)sampleRate;
 
-        _state.Update(
-            _bassEnvelope.Update(MapDbfsToUnit(bassDbfs), deltaSeconds),
-            _midEnvelope.Update(MapDbfsToUnit(midDbfs), deltaSeconds),
-            _highEnvelope.Update(MapDbfsToUnit(highDbfs), deltaSeconds),
-            bassDbfs,
-            midDbfs,
-            highDbfs);
+        for (int band = 0; band < _bands.Length; band++)
+        {
+            int binCount = _bandBinCounts[band];
+            double averagePower = binCount > 0 ? _bandPower[band] / binCount : 0;
+
+            double dbfs = PowerToDbfs(averagePower) + _settings.InputGainDb;
+
+            // НОВОЕ: компенсация естественного спада энергии музыки к высоким
+            // частотам. Вставляется здесь — ПОСЛЕ InputGainDb (общий уровень
+            // для всех полос), но ДО того, как результат уйдёт в spectrumDbfs
+            // и в EnvelopeFollower — то есть влияет на итоговую картинку,
+            // но не искажает "сырые" dBFS раньше времени
+            double centerHz = (_bands[band].StartHz + _bands[band].EndHz) / 2.0;
+            double octavesAboveReference = Math.Log2(centerHz / _settings.TiltReferenceHz);
+            dbfs += octavesAboveReference * _settings.SpectralTiltDbPerOctave;
+
+            spectrumDbfs[band] = dbfs;
+            spectrumUnit[band] = _bandEnvelopes[band].Update(MapDbfsToUnit(dbfs), deltaSeconds);
+        }
+
+        _state.Update(spectrumUnit, spectrumDbfs);
 
         if (_settings.LogMeasuredLevels && Environment.TickCount64 - _lastLogTimestamp >= 1_000)
         {
             _lastLogTimestamp = Environment.TickCount64;
-            Console.WriteLine($"[Audio] IN {PowerToDbfs(inputPower):F1} dBFS | B {bassDbfs:F1} | M {midDbfs:F1} | H {highDbfs:F1}");
+            Console.WriteLine($"[Audio] Мин dBFS: {spectrumDbfs.Min():F1} | Макс dBFS: {spectrumDbfs.Max():F1}");
         }
     }
 
@@ -157,10 +243,7 @@ public sealed class AudioAnalyzer
 
     private double MapDbfsToUnit(double dbfs)
     {
-        double unit = Math.Clamp(
-            (dbfs - _settings.FloorDbfs) / (_settings.CeilingDbfs - _settings.FloorDbfs),
-            0,
-            1);
+        double unit = Math.Clamp((dbfs - _settings.FloorDbfs) / (_settings.CeilingDbfs - _settings.FloorDbfs), 0, 1);
         return Math.Pow(unit, _settings.ResponseCurve);
     }
 
